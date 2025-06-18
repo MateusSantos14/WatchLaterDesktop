@@ -1,0 +1,235 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+
+import gi
+import subprocess
+import os
+import io
+import json
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, GLib, GdkPixbuf
+
+class YTM_Window(Gtk.Window):
+    def __init__(self):
+        Gtk.Window.__init__(self, title="YTM Manager")
+        self.set_border_width(10)
+        self.set_default_size(800, 600)
+
+        self.notebook = Gtk.Notebook()
+        
+        main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        main_vbox.pack_start(self.notebook, True, True, 0)
+        
+        self.progress_bar = Gtk.ProgressBar()
+        self.progress_bar.set_no_show_all(True) 
+        main_vbox.pack_start(self.progress_bar, False, True, 0)
+        
+        self.statusbar = Gtk.Statusbar()
+        main_vbox.pack_start(self.statusbar, False, True, 0)
+        
+        self.add(main_vbox)
+
+        self.create_queue_page()
+        self.create_archive_page()
+        self.connect("destroy", Gtk.main_quit)
+
+        self.on_refresh_all_clicked()
+    
+    def on_refresh_all_clicked(self, widget=None):
+        self.on_refresh_queue_clicked()
+        self.on_refresh_archive_clicked()
+
+    def create_queue_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.notebook.append_page(page, Gtk.Label(label="Watch Queue"))
+        
+        hbox_add = Gtk.Box(spacing=6)
+        page.pack_start(hbox_add, False, True, 0)
+        self.url_entry = Gtk.Entry(placeholder_text="Paste a YouTube URL here and click Add")
+        hbox_add.pack_start(self.url_entry, True, True, 0)
+        add_button = Gtk.Button(label="Add Video")
+        add_button.connect("clicked", self.on_add_clicked)
+        hbox_add.pack_start(add_button, False, True, 0)
+
+        scrolled_window = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
+        page.pack_start(scrolled_window, True, True, 0)
+        self.queue_list_box = Gtk.ListBox()
+        scrolled_window.add(self.queue_list_box)
+        
+        hbox_actions = Gtk.Box(spacing=6)
+        page.pack_start(hbox_actions, False, True, 0)
+        watch_button = Gtk.Button(label="Watch Next Video")
+        watch_button.connect("clicked", self.on_watch_clicked)
+        refresh_button = Gtk.Button.new_with_label("🔄 Refresh All Lists")
+        refresh_button.connect("clicked", self.on_refresh_all_clicked)
+        cleanup_button = Gtk.Button(label="Cleanup Watched")
+        cleanup_button.connect("clicked", self.on_cleanup_clicked)
+        hbox_actions.pack_start(watch_button, True, True, 0)
+        hbox_actions.pack_start(refresh_button, True, True, 0)
+        hbox_actions.pack_start(cleanup_button, True, True, 0)
+
+    def create_archive_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.notebook.append_page(page, Gtk.Label(label="Archive"))
+        
+        scrolled_window = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
+        page.pack_start(scrolled_window, True, True, 0)
+        self.archive_list_box = Gtk.ListBox()
+        self.archive_list_box.connect("row-activated", self.on_list_row_activated)
+        scrolled_window.add(self.archive_list_box)
+
+    def create_list_row(self, json_path):
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+
+        title = data.get('title', 'Unknown Title')
+        channel = data.get('channel', 'Unknown Channel')
+        video_filepath = data.get('_filename')
+
+        base_path, _ = os.path.splitext(json_path)
+        thumbnail_path = None
+        for ext in ['.webp', '.jpg', '.png', '.jpeg']:
+            if os.path.exists(base_path + ext):
+                thumbnail_path = base_path + ext
+                break
+
+        row = Gtk.ListBoxRow()
+        row.set_data("video_path", video_filepath)
+
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=15, margin=5)
+        row.add(hbox)
+
+        try:
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(thumbnail_path, 120, 68) if thumbnail_path else None
+            image = Gtk.Image.new_from_pixbuf(pixbuf)
+        except GLib.Error:
+            image = Gtk.Image.new_from_icon_name("video-x-generic", Gtk.IconSize.DIALOG)
+        hbox.pack_start(image, False, True, 0)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        hbox.pack_start(vbox, True, True, 0)
+
+        title_label = Gtk.Label(xalign=0)
+        title_label.set_markup(f"<b>{GLib.markup_escape_text(title)}</b>")
+        title_label.set_line_wrap(True)
+        vbox.pack_start(title_label, True, True, 0)
+        
+        channel_label = Gtk.Label(label=channel, xalign=0)
+        vbox.pack_start(channel_label, True, True, 0)
+
+        return row
+
+    def populate_list_box(self, list_box, directory):
+        for child in list_box.get_children():
+            list_box.remove(child)
+
+        if not os.path.exists(directory):
+            list_box.add(Gtk.Label(label=f"Directory not found."))
+            list_box.show_all()
+            return
+
+        json_files = sorted([os.path.join(directory, f) for f in os.listdir(directory) if f.endswith('.info.json')], key=os.path.getmtime, reverse=True)
+        
+        if not json_files:
+            list_box.add(Gtk.Label(label="This list is empty."))
+        else:
+            for json_path in json_files:
+                row = self.create_list_row(json_path)
+                if row:
+                    list_box.add(row)
+        list_box.show_all()
+
+    def on_refresh_queue_clicked(self, widget=None):
+        queue_dir = self.get_path_from_config("QUEUE_DIR")
+        if queue_dir: self.populate_list_box(self.queue_list_box, queue_dir)
+        
+    def on_refresh_archive_clicked(self, widget=None):
+        archive_dir = self.get_path_from_config("ARCHIVE_DIR")
+        if archive_dir: self.populate_list_box(self.archive_list_box, archive_dir)
+
+    def on_list_row_activated(self, listbox, row):
+        video_path = row.get_data("video_path")
+        if video_path and os.path.exists(video_path):
+            self.statusbar.push(0, f"Playing {os.path.basename(video_path)}...")
+            subprocess.Popen(["vlc", video_path])
+        else:
+            self.statusbar.push(0, "Error: Video file not found.")
+
+    def get_path_from_config(self, key):
+        config_path = os.path.expanduser("~/.config/ytm/config")
+        try:
+            with open(config_path, 'r') as f:
+                for line in f:
+                    if line.startswith(key):
+                        return line.split("=", 1)[1].strip().strip('"')
+        except FileNotFoundError:
+            self.statusbar.push(0, "Config file not found."); return None
+        return None
+
+    def on_add_clicked(self, widget):
+        url = self.url_entry.get_text()
+        if not url.startswith("http"):
+            self.statusbar.push(0, "Please enter a valid URL."); return
+
+        self.url_entry.set_text("")
+        self.progress_bar.set_fraction(0)
+        self.progress_bar.set_text("Starting download...")
+        self.progress_bar.set_show_text(True); self.progress_bar.show()
+
+        try:
+            process = subprocess.Popen(["ytm", "download-with-progress", url], stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1, universal_newlines=True)
+            GLib.io_add_watch(process.stdout, GLib.IO_IN, self.on_download_progress)
+            GLib.child_watch_add(process.pid, self.on_download_finished)
+        except FileNotFoundError:
+            self.statusbar.push(0, "Error: 'ytm' command not found."); self.progress_bar.hide()
+            
+    def on_download_progress(self, source, condition):
+        line = source.readline();
+        if line:
+            try:
+                percentage = float(line.strip()); fraction = percentage / 100.0
+                self.progress_bar.set_fraction(fraction); self.progress_bar.set_text(f"{percentage:.1f}% downloaded")
+            except (ValueError, IndexError): pass
+            return True
+        return False
+
+    def on_download_finished(self, pid, status):
+        self.progress_bar.set_fraction(1.0); self.progress_bar.set_text("Download complete! Refreshing...")
+        GLib.timeout_add(1500, self.hide_progress_and_refresh)
+        
+    def hide_progress_and_refresh(self):
+        self.progress_bar.hide(); self.on_refresh_all_clicked(); return False
+
+    def on_watch_clicked(self, widget):
+        self.run_command_async(["ytm", "watch", "--gui"], self.on_refresh_all_clicked)
+
+    def on_cleanup_clicked(self, widget):
+        self.run_command_async(["ytm", "cleanup", "--yes"], self.on_refresh_all_clicked)
+
+    def run_command_async(self, command_array, callback_on_finish=None):
+        try:
+            self.statusbar.push(0, f"Running: {' '.join(command_array)}...")
+            process = subprocess.Popen(command_array, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            GLib.child_watch_add(process.pid, lambda pid, status: self.on_command_finished(process, callback_on_finish))
+        except FileNotFoundError: self.statusbar.push(0, "Error: 'ytm' command not found.")
+            
+    _on_command_finished_is_running = False
+    def on_command_finished(self, process, callback):
+        if self._on_command_finished_is_running: return
+        self._on_command_finished_is_running = True
+        stdout, stderr = process.communicate()
+        if process.returncode == 0:
+            self.statusbar.push(0, "Command finished successfully.")
+            if callback: callback()
+        else:
+            self.statusbar.push(0, f"Error: {stderr.strip()}")
+        self._on_command_finished_is_running = False
+
+# --- Main execution ---
+win = YTM_Window()
+win.show_all()
+Gtk.main()
