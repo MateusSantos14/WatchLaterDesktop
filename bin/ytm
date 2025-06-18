@@ -1,0 +1,211 @@
+#!/bin/bash
+# --- ytm (Core CLI Engine) ---
+
+set -e
+set -o pipefail
+
+# --- CONFIGURATION ---
+CONFIG_FILE="$HOME/.config/ytm/config"
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "❌ Error: Configuration file not found. Please run install.sh"
+    exit 1
+fi
+
+# --- CORE FUNCTIONS ---
+
+func_help() {
+    echo "🎬 ytm (YouTube Manager)"
+    echo "Usage: ytm <command>"
+    echo ""
+    echo "Commands:"
+    echo "  add [url]           Adds a video to the queue (from URL or clipboard)."
+    echo "  watch [--gui]       Plays the next video from the queue."
+    echo "  list                Lists the videos in the 'Watch Queue'."
+    echo "  list-archive        Lists videos in the 'Archive'."
+    echo "  play-archive        Interactively play a video from the 'Archive'."
+    echo "  status              Shows a summary of all folders."
+    echo "  cleanup [--yes|-y]  Permanently deletes all 'Watched' videos."
+    echo "  help                Displays this help message."
+}
+
+func_get_clipboard() {
+    if command -v pbpaste &> /dev/null; then pbpaste;
+    elif command -v xclip &> /dev/null; then xclip -selection clipboard -o;
+    fi
+}
+
+func_add() {
+    source "$CONFIG_FILE"
+    URL="$1"
+    if [[ -z "$URL" ]]; then URL=$(func_get_clipboard); fi
+    if [[ ! "$URL" =~ ^http ]]; then echo "❌ Error: Invalid URL" && exit 1; fi
+    echo "📥 Downloading to queue: $URL"
+    yt-dlp \
+        --write-info-json \
+        --write-thumbnail \
+        -P "$QUEUE_DIR" \
+        -f 'bv*[height<=1080]+ba/b' \
+        -o "%(title)s [%(channel)s].%(ext)s" \
+        "$URL"
+}
+
+func_download_with_progress() {
+    source "$CONFIG_FILE"
+    URL="$1"
+    local ytdlp_flags=(
+        --write-info-json
+        --write-thumbnail
+        -P "$QUEUE_DIR"
+        -f 'bv*[height<=1080]+ba/b'
+        -o "%(title)s [%(channel)s].%(ext)s"
+        "$URL"
+        -q --progress --progress-template "%(progress.percentage)s"
+    )
+    if command -v unbuffer &> /dev/null; then
+        unbuffer yt-dlp "${ytdlp_flags[@]}"
+    else
+        yt-dlp "${ytdlp_flags[@]}"
+    fi
+}
+
+func_list() {
+    source "$CONFIG_FILE"
+    echo "📄 Watch Queue:"
+    if [ -z "$(ls -A "$QUEUE_DIR")" ]; then echo "   (Empty)"; else
+        # Lista apenas os arquivos de vídeo, não os de metadados
+        find "$QUEUE_DIR" -maxdepth 1 -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" \) -printf "%f\n" | nl -w2 -s'. '
+    fi
+}
+
+func_list_archive() {
+    source "$CONFIG_FILE"
+    echo "🗄️  Archived Videos:"
+    if [ -z "$(ls -A "$ARCHIVE_DIR")" ]; then echo "   (Empty)"; else
+        find "$ARCHIVE_DIR" -maxdepth 1 -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" \) -printf "%f\n"
+    fi
+}
+
+func_play_archive() {
+    source "$CONFIG_FILE"
+    if [ -z "$(ls -A "$ARCHIVE_DIR")" ]; then echo "Archive is empty." && exit 0; fi
+
+    if command -v fzf &> /dev/null; then
+        VIDEO_PATH=$(find "$ARCHIVE_DIR" -maxdepth 1 -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" \) | fzf --prompt="Select Archived Video> ")
+    else
+        echo "💡 For a better experience, install 'fzf' (fuzzy finder)."
+        PS3="Enter a number to play (or Ctrl+C to exit): "
+        select FILENAME in "$(find "$ARCHIVE_DIR" -maxdepth 1 -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" \) -printf "%f\n")"; do
+            VIDEO_PATH="$ARCHIVE_DIR/$FILENAME"
+            break
+        done
+    fi
+    if [ -n "$VIDEO_PATH" ]; then
+        echo "▶️  Playing from archive: $(basename "$VIDEO_PATH")"
+        vlc "$VIDEO_PATH"
+    fi
+}
+
+func_status() {
+    source "$CONFIG_FILE"
+    echo "📊 Library Status:"
+    echo "  - 📥 Queue:   $(find "$QUEUE_DIR" -maxdepth 1 -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" \) | wc -l) video(s)"
+    echo "  - 👍 Watched:  $(find "$WATCHED_DIR" -maxdepth 1 -type f | wc -l) video(s)"
+    echo "  - 🗄️  Archive: $(find "$ARCHIVE_DIR" -maxdepth 1 -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" \) | wc -l) video(s)"
+}
+
+func_cleanup() {
+    source "$CONFIG_FILE"
+    # Conta todos os arquivos na pasta, não só vídeos
+    COUNT=$(find "$WATCHED_DIR" -maxdepth 1 -type f | wc -l)
+    
+    if [ "$COUNT" -eq 0 ]; then
+        if [[ "$1" != "--yes" && "$1" != "-y" ]]; then echo "✨ 'Watched' folder is already empty."; fi
+        exit 0
+    fi
+
+    local auto_approve=false
+    if [[ "$1" == "--yes" || "$1" == "-y" ]]; then auto_approve=true; fi
+
+    if [[ "$auto_approve" == true ]]; then
+        echo "Auto-approving deletion of $COUNT file(s)..."
+        find "$WATCHED_DIR" -maxdepth 1 -type f -delete
+        echo "✅ Cleanup complete!"
+    else
+        read -p "🗑️  Permanently delete $COUNT file(s) from 'Watched'? (y/n): " choice
+        if [[ "$(echo "$choice" | tr '[:upper:]' '[:lower:]')" =~ ^(y|yes)$ ]]; then
+            find "$WATCHED_DIR" -maxdepth 1 -type f -delete
+            echo "✅ Cleanup complete!"
+        else
+            echo "👍 No action taken."
+        fi
+    fi
+}
+
+func_watch() {
+    source "$CONFIG_FILE"
+    VIDEO_PATH=$(find "$QUEUE_DIR" -maxdepth 1 -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" \) | head -n 1)
+
+    if [[ -z "$VIDEO_PATH" ]]; then
+        if [[ "$1" == "--gui" ]]; then
+            zenity --info --text="🎉 Your watch queue is empty!" --title="YTM Manager"
+        else
+            echo "🎉 Your watch queue is empty!"
+        fi
+        exit 0
+    fi
+
+    echo "▶️  Now Playing: $(basename "$VIDEO_PATH")"
+    vlc "$VIDEO_PATH"
+
+    if [[ "$1" == "--gui" ]]; then
+        CHOICE=$(zenity --question --title="Video Finished" --text="🎬 What to do with:\n<b>$(basename "$VIDEO_PATH")</b>?" --ok-label="Move to Watched" --extra-button="Archive Permanently" --extra-button="Delete Immediately" --extra-button="Do Nothing" 2>/dev/null)
+        EXIT_CODE=$?
+        if [ $EXIT_CODE -eq 0 ]; then ACTION="Move to Watched"; else ACTION="$CHOICE"; fi
+    else
+        read -p "Action? (M)ove, (A)rchive, (D)elete, (N)othing: " t_choice
+        case "$(echo "$t_choice" | tr '[:upper:]' '[:lower:]')" in
+            a) ACTION="Archive Permanently";;
+            d) ACTION="Delete Immediately";;
+            n) ACTION="Do Nothing";;
+            *) ACTION="Move to Watched";;
+        esac
+    fi
+    
+    BASE_PATH="${VIDEO_PATH%.*}" # Remove a extensão do vídeo
+    
+    case "$ACTION" in
+        "Move to Watched") 
+            # Move todos os arquivos associados (vídeo, json, thumbnail)
+            mv "$BASE_PATH".* "$WATCHED_DIR/" 2>/dev/null || true
+            echo "👍 Moved to 'Watched'."
+            ;;
+        "Archive Permanently") 
+            mv "$BASE_PATH".* "$ARCHIVE_DIR/" 2>/dev/null || true
+            echo "🗄️  Archived."
+            ;;
+        "Delete Immediately") 
+            rm "$BASE_PATH".* 2>/dev/null || true
+            echo "🗑️  Deleted."
+            ;;
+        *) 
+            echo "👍 No action taken."
+            ;;
+    esac
+}
+
+# --- COMMAND ROUTER ---
+COMMAND="$1"
+shift
+case "$COMMAND" in
+    add) func_add "$@";;
+    watch) func_watch "$@";;
+    list) func_list;;
+    list-archive) func_list_archive;;
+    play-archive) func_play_archive;;
+    status) func_status;;
+    cleanup) func_cleanup "$@";;
+    download-with-progress) func_download_with_progress "$@";;
+    help|--help|-h) func_help;;
+    *) echo "❌ Error: Unknown command '$COMMAND'" && func_help && exit 1;;
+esac
+exit 0
